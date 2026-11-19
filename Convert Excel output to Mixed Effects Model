@@ -1,0 +1,488 @@
+## USE THIS ONE
+
+import os
+import pandas as pd
+import numpy as np
+
+# --- helper function to avoid overwriting files ---
+def _unique_output_path(path):
+    """Generates a unique file path by appending a number if the file exists."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    counter = 1
+    new_path = f"{base} ({counter}){ext}"
+    while os.path.exists(new_path):
+        counter += 1
+        new_path = f"{base} ({counter}){ext}"
+    return new_path
+
+
+def _sanitize_filename_part(s: str) -> str:
+    """Make a string safe-ish for filenames."""
+    s = str(s).strip()
+    for ch in ["/", "\\", ":", "*", "?", "\"", "<", ">", "|"]:
+        s = s.replace(ch, "_")
+    s = " ".join(s.split())
+    return s
+
+
+def _parse_treatment_well_image_from_filename(filename: str, treatment_tokens=(0, 1)):
+    """
+    From the filename in column A, parse underscore-separated tokens (before extension).
+
+    EDITS IMPLEMENTED:
+      - Treatment = specified tokens joined by "_" (default: parts[0] + "_" + parts[1])
+        - Short filenames use available selected tokens, or parts[0] if none exist.
+      - Well_raw  = 4th-to-last token (parts[-4])
+      - Image_raw = 3rd-to-last token (parts[-3])
+
+    Args:
+      treatment_tokens: nonempty tuple of nonnegative, zero-based token indices
+                        e.g., (0, 1) for first two, (1, 2, 3) for second through fourth
+
+    Returns: (treatment, well_raw, image_raw)
+      - well_raw / image_raw converted to int when possible; else kept as string.
+    """
+    if not treatment_tokens or any(not isinstance(i, int) or i < 0 for i in treatment_tokens):
+        raise ValueError("treatment_tokens must contain nonnegative integer indices")
+
+    filename = str(filename).strip()
+    base = os.path.splitext(os.path.basename(filename))[0]
+    parts = [p for p in base.split("_") if p != ""]
+
+    if not parts:
+        return ("Unknown", "Unknown", "Unknown")
+
+    # Extract treatment based on specified token positions
+    selected_tokens = [parts[i] for i in treatment_tokens if i < len(parts)]
+    treatment = "_".join(selected_tokens) if selected_tokens else parts[0]
+
+    # Guard for short filenames
+    if len(parts) < 4:
+        return (treatment, "Unknown", "Unknown")
+
+    well_tok = parts[-4]
+    image_tok = parts[-3]
+
+    try:
+        well_raw = int(well_tok)
+    except (ValueError, TypeError):
+        well_raw = str(well_tok).strip()
+
+    try:
+        image_raw = int(image_tok)
+    except (ValueError, TypeError):
+        image_raw = str(image_tok).strip()
+
+    return (treatment, well_raw, image_raw)
+
+
+def _assign_well_numbers_change_based(
+    filenames: pd.Series,
+    sort_by_filename: bool = True,
+    treatment_tokens=(0, 1),
+) -> pd.Series:
+    """
+    Well numbering: simple sequential counter.
+
+      - If sort_by_filename=True, compute wells in filename-sorted order.
+      - Well starts at 1.
+      - Well increments ONLY when the raw well token (4th-to-last filename element) 
+        changes compared to the previous row.
+      - The well NUMBER is independent of the actual well TOKEN value.
+      - Returns a Series aligned to the original index of `filenames`.
+
+    Example:
+      Filename with well token "A1" -> Well 1
+      Filename with well token "A1" -> Well 1 (same token)
+      Filename with well token "B2" -> Well 2 (token changed)
+      Filename with well token "B2" -> Well 2 (same token)
+      
+    This creates continuous well numbering across ALL samples in the sheet.
+    """
+    filenames = filenames.astype(str)
+
+    if sort_by_filename:
+        order = filenames.sort_values(kind="mergesort").index
+    else:
+        order = filenames.index
+
+    prev_well_raw = object()  # Sentinel value that won't match anything
+    current_well = 0
+    wells = {}
+
+    for i in order:
+        fn = filenames.loc[i]
+        # missing filename -> leave NA; it will be filtered later
+        if fn.strip() == "" or fn.lower() == "nan":
+            wells[i] = np.nan
+            continue
+
+        _, well_raw, _ = _parse_treatment_well_image_from_filename(fn, treatment_tokens)
+
+        # Increment well counter whenever the well token changes
+        if well_raw != prev_well_raw:
+            current_well += 1
+            prev_well_raw = well_raw
+
+        wells[i] = current_well
+
+    return pd.Series(wells).reindex(filenames.index)
+
+
+def _assign_image_from_filename(filenames: pd.Series, treatment_tokens=(0, 1)) -> pd.Series:
+    """
+    REIMPLEMENTED image assignment:
+      - Image is taken directly from the parsed 3rd-to-last token (int if possible, else string).
+    """
+    filenames = filenames.astype(str)
+    images = []
+    for fn in filenames:
+        if fn.strip() == "" or fn.lower() == "nan":
+            images.append(np.nan)
+            continue
+        _, _, image_raw = _parse_treatment_well_image_from_filename(fn, treatment_tokens)
+        images.append(image_raw)
+    return pd.Series(images, index=filenames.index)
+
+
+def split_excel_sheet_multi_results(
+    df: pd.DataFrame,
+    sheet_name: str,
+    input_excel_path: str,
+    filename_col=0,                  # Column A by index
+    results_cols=None,               # all other columns by default
+    overwrite: bool = False,
+    biological_rep=None,
+    biological_rep_col=None,         # NEW: column index for bio rep (e.g., 8 for column I)
+    output_dir=None,
+    include_sheet_name_in_output: bool = True,
+    sort_by_filename: bool = True,
+    treatment_tokens=(0, 1),         # NEW: which tokens to use for treatment
+):
+    """
+    For ONE sheet:
+      - reads filenames from column A (by index)
+      - for each metric column (all columns except column A by default), writes a separate CSV.
+
+    Each output CSV contains columns:
+      Filename, Treatment, Biological_Rep, Well, Image, Results
+
+    EDITS IMPLEMENTED:
+      - Treatment: specified tokens of filename (default: first 2 tokens)
+      - Well: sequential counter (1, 2, 3...) that increments whenever the well token changes
+              - Independent of bio rep
+              - Independent of actual well token value
+      - Image: parsed directly from filename token (-3)
+      - Biological_Rep: 
+        * If biological_rep_col is specified, read from that column (0-indexed)
+        * Otherwise, use the biological_rep argument (sheet-level default)
+      - treatment_tokens: tuple (e.g., (0, 1) or (1, 2, 3)) specifying which tokens form treatment
+    """
+    if df.shape[1] < 2:
+        print(f"  Warning: Sheet has only {df.shape[1]} column(s). Need at least 2 (filename + results).")
+        return {}
+
+    if filename_col >= df.shape[1]:
+        print(f"  Warning: filename_col index {filename_col} out of range for sheet with {df.shape[1]} columns.")
+        return {}
+
+    # Determine result columns
+    if results_cols is None:
+        results_cols = [c for c in range(df.shape[1]) if c != filename_col]
+    else:
+        results_cols = [c for c in results_cols if c < df.shape[1] and c != filename_col]
+
+    # Exclude biological_rep_col from results if specified
+    if biological_rep_col is not None and biological_rep_col in results_cols:
+        results_cols.remove(biological_rep_col)
+
+    if not results_cols:
+        print("  Warning: No result columns found to export.")
+        return {}
+
+    # ---- choose output directory ----
+    if output_dir is None:
+        out_root = os.path.dirname(os.path.abspath(input_excel_path))
+    else:
+        out_root = os.path.abspath(output_dir)
+        os.makedirs(out_root, exist_ok=True)
+
+    in_stem = os.path.splitext(os.path.basename(input_excel_path))[0]
+    safe_sheet_name = _sanitize_filename_part(sheet_name)
+
+    # Filenames as a Series (keep original row mapping)
+    filenames = df.iloc[:, filename_col]
+
+    # NEW: Determine biological replicate source
+    if biological_rep_col is not None:
+        if biological_rep_col >= df.shape[1]:
+            print(f"  Warning: biological_rep_col {biological_rep_col} out of range. Using default value.")
+            bio_rep_series = pd.Series([biological_rep] * len(df), index=df.index)
+        else:
+            bio_rep_series = df.iloc[:, biological_rep_col]
+            print(f"  Reading Biological_Rep from column {biological_rep_col} ('{df.columns[biological_rep_col]}')")
+    else:
+        bio_rep_series = pd.Series([biological_rep] * len(df), index=df.index)
+
+    # Compute Treatment / Well / Image with the reimplemented rules
+    treatment = []
+    skipped_name_rows = 0
+
+    for v in filenames:
+        if pd.isna(v) or str(v).strip() == "":
+            skipped_name_rows += 1
+            treatment.append(np.nan)
+        else:
+            t, _, _ = _parse_treatment_well_image_from_filename(v, treatment_tokens)
+            treatment.append(t)
+
+    treatment = pd.Series(treatment, index=df.index)
+    
+    # Well numbering: sequential counter independent of bio rep
+    well = _assign_well_numbers_change_based(filenames.fillna(""), sort_by_filename=sort_by_filename, treatment_tokens=treatment_tokens)
+    image = _assign_image_from_filename(filenames.fillna(""), treatment_tokens=treatment_tokens)
+
+    if skipped_name_rows > 0:
+        print(f"  Skipped {skipped_name_rows} row(s) due to missing filename")
+
+    per_metric_outputs = {}
+
+    for col_idx in results_cols:
+        metric_name = df.columns[col_idx]
+        metric_name_safe = _sanitize_filename_part(metric_name)
+
+        out_df = pd.DataFrame({
+            "Filename": filenames.astype(str).str.strip(),
+            "Treatment": treatment,
+            "Biological_Rep": bio_rep_series,
+            "Well": well,
+            "Image": image,
+            "Results": df.iloc[:, col_idx],
+        })
+
+        # Drop rows missing filename OR missing result
+        out_df["Filename"] = out_df["Filename"].replace({"nan": np.nan, "": np.nan})
+        before = len(out_df)
+        out_df = out_df.dropna(subset=["Filename", "Results"]).reset_index(drop=True)
+        skipped_results = before - len(out_df)
+
+        if out_df.empty:
+            print(f"  No valid rows to export for metric '{metric_name}' (column {col_idx}).")
+            continue
+
+        if include_sheet_name_in_output:
+            out_path = os.path.join(out_root, f"{in_stem}_{safe_sheet_name}_{metric_name_safe}.csv")
+        else:
+            out_path = os.path.join(out_root, f"{in_stem}_{metric_name_safe}.csv")
+
+        if not overwrite:
+            out_path = _unique_output_path(out_path)
+
+        out_df.to_csv(out_path, index=False)
+
+        print(f"\n✓ Saved: {out_path}")
+        print(f"  Sheet: {sheet_name}")
+        print(f"  Metric: {metric_name} (col {col_idx})")
+        print(f"  Treatment tokens: positions {treatment_tokens} (0-indexed)")
+        print(f"  Biological Replicate: {'from column ' + str(biological_rep_col) if biological_rep_col is not None else biological_rep}")
+        print(f"  Total rows: {len(out_df)}")
+        if skipped_results > 0:
+            print(f"  Skipped {skipped_results} row(s) due to missing filename/result values")
+
+        per_metric_outputs[str(metric_name)] = (out_df, out_path)
+
+    return per_metric_outputs
+
+
+def split_excel_all_sheets_multi_results(
+    input_excel_path,
+    filename_col=0,
+    results_cols=None,
+    overwrite=False,
+    biological_reps=None,
+    biological_rep_col=None,         # NEW: column index to read bio rep from (e.g., 8 for column I)
+    output_dir=None,
+    include_sheet_name_in_output: bool = True,
+    sort_by_filename: bool = True,
+    treatment_tokens=(0, 1),         # NEW: which filename tokens to use for treatment
+):
+    """
+    EDITS IMPLEMENTED: Bio rep assignment behavior (reimplemented)
+      - biological_rep_col is int  -> read bio rep from that column (0-indexed) for ALL sheets
+      - biological_reps is int     -> same bio rep for all sheets (if biological_rep_col is None)
+      - biological_reps is dict    -> per-sheet bio rep, e.g. {"6hr": 1, "24hr": 1, ...}
+      - biological_reps is None/other -> prompt per sheet (if biological_rep_col is None)
+      - treatment_tokens: tuple specifying which filename tokens form treatment (e.g., (0, 1) or (1, 2, 3))
+      
+    Well numbering: Sequential counter (1, 2, 3...) that increments whenever well token changes
+                    - Continues across ALL samples (all treatments, all bio reps)
+      
+    Priority: biological_rep_col > biological_reps
+    """
+    excel_file = pd.ExcelFile(input_excel_path)
+    sheet_names = excel_file.sheet_names
+
+    print(f"\n{'='*60}")
+    print("Excel → Mixed Models CSV Converter")
+    print(f"{'='*60}")
+    print(f"Input file: {os.path.basename(input_excel_path)}")
+    print(f"Found {len(sheet_names)} sheet(s):")
+    for i, name in enumerate(sheet_names, 1):
+        print(f"  {i}. {name}")
+    print()
+    print("Column mapping:")
+    print(f"  Filenames: Column index {filename_col} (A)")
+    print(f"  Treatment: Tokens {treatment_tokens} from filename (0-indexed)")
+    print(f"  Results:   {('ALL other columns' if results_cols is None else list(results_cols))}")
+    
+    # NEW: Bio rep source reporting
+    if biological_rep_col is not None:
+        print(f"  Biological_Rep: From column index {biological_rep_col} (Excel column {chr(65 + biological_rep_col)})")
+    elif isinstance(biological_reps, int):
+        print(f"  Biological_Rep: Default value {biological_reps} for all sheets")
+    elif isinstance(biological_reps, dict):
+        print(f"  Biological_Rep: Per-sheet mapping provided")
+    else:
+        print(f"  Biological_Rep: Will prompt for each sheet")
+    
+    print(f"  Sort by filename: {sort_by_filename}")
+    print(f"  Well numbering: Sequential counter across all samples (increments when well token changes)")
+    if output_dir is not None:
+        print(f"  Output:    {os.path.abspath(output_dir)}")
+    print()
+
+    def _bio_rep_for_sheet(sheet_name: str):
+        """Only called if biological_rep_col is None"""
+        if isinstance(biological_reps, dict):
+            return biological_reps.get(sheet_name, None)
+        if isinstance(biological_reps, int):
+            return biological_reps
+        while True:
+            try:
+                return int(input(f"Enter Biological Replicate number for sheet '{sheet_name}': "))
+            except ValueError:
+                print("Please enter a valid integer number.")
+
+    all_results = {}
+
+    for sheet_name in sheet_names:
+        print(f"\n{'─'*60}")
+        print(f"Processing sheet: {sheet_name}")
+        print(f"{'─'*60}")
+
+        df = pd.read_excel(input_excel_path, sheet_name=sheet_name)
+
+        # Determine bio rep value (only used if biological_rep_col is None)
+        bio_rep = _bio_rep_for_sheet(sheet_name) if biological_rep_col is None else None
+
+        per_metric_outputs = split_excel_sheet_multi_results(
+            df=df,
+            sheet_name=sheet_name,
+            input_excel_path=input_excel_path,
+            filename_col=filename_col,
+            results_cols=results_cols,
+            overwrite=overwrite,
+            biological_rep=bio_rep,
+            biological_rep_col=biological_rep_col,
+            output_dir=output_dir,
+            include_sheet_name_in_output=include_sheet_name_in_output,
+            sort_by_filename=sort_by_filename,
+            treatment_tokens=treatment_tokens,
+        )
+
+        if per_metric_outputs:
+            all_results[sheet_name] = per_metric_outputs
+
+    print(f"\n{'='*60}")
+    print(f"SUMMARY: Processed {len(all_results)} sheet(s)")
+    print(f"{'='*60}")
+    for sheet_name, metrics in all_results.items():
+        print(f"  {sheet_name}:")
+        for metric_name, (df_out, path) in metrics.items():
+            print(f"    - {metric_name}: {len(df_out)} rows → {os.path.basename(path)}")
+    print(f"{'='*60}\n")
+
+    return all_results
+
+
+# ================================================================================
+# USAGE EXAMPLES
+# ================================================================================
+EXCEL_FILE_PATH = '/Users/allisonpickle/Desktop/Old Compiled w3/Compiled 5ugLPS 10uM w3/Isolated microglia/Perimeter_Area_ConvexHull_Circularity_AspectRoughness_Results.xlsx'
+OUTPUT_DIR ='/Users/allisonpickle/Desktop/Old Compiled w3/Compiled 5ugLPS 10uM w3/Isolated microglia'
+
+if not os.path.exists(EXCEL_FILE_PATH):
+    print(f"ERROR: File not found at {EXCEL_FILE_PATH}")
+else:
+    # ============================================================
+    # OPTION 1: Treatment from FIRST TWO tokens (default)
+    # Example filename: Tri_Ctrl_001_A1_1_C_0.tiff
+    # Treatment will be: "Tri_Ctrl"
+    # ============================================================
+    # results = split_excel_all_sheets_multi_results(
+    #     EXCEL_FILE_PATH,
+    #     filename_col=0,
+    #     results_cols=None,
+    #     overwrite=False,
+    #     biological_rep_col=None,
+    #     output_dir=OUTPUT_DIR,
+    #     include_sheet_name_in_output=True,
+    #     sort_by_filename=True,
+    #     treatment_tokens=(0, 1),     # <-- First two tokens (0 and 1)
+    # )
+
+    
+    # # ============================================================
+    # # OPTION 2: Treatment from SECOND and THIRD tokens
+    # # Example filename: 48hr_Tri_Ctrl_001_A1_1_C_0.tiff
+    # # Treatment will be: "Tri_Ctrl"
+    # # ============================================================
+    # results = split_excel_all_sheets_multi_results(
+    #     EXCEL_FILE_PATH,
+    #     filename_col=0,
+    #     results_cols=None,
+    #     overwrite=False,
+    #     biological_reps=1,
+    #     biological_rep_col=None,
+    #     output_dir=OUTPUT_DIR,
+    #     include_sheet_name_in_output=True,
+    #     sort_by_filename=True,
+    #     treatment_tokens=(0, 1),     # <-- Second and third tokens (1 and 2)
+    # )
+    
+    # # ============================================================
+    # # OPTION 3: Read biological_rep from column B (index 1)
+    # # ============================================================
+    results = split_excel_all_sheets_multi_results(
+        EXCEL_FILE_PATH,
+        filename_col=0,
+        results_cols=None,
+        overwrite=False,
+        biological_reps=None,
+        biological_rep_col=1,        # <-- Column B (0-indexed)
+        output_dir=OUTPUT_DIR,
+        include_sheet_name_in_output=False,
+        sort_by_filename=True,
+        treatment_tokens=(2, 3),     # <-- Can also use (1, 2) if needed
+    )
+
+    # ============================================================
+    # OPTION 4: Treatment from THREE tokens; bio rep from column B
+    # Example filename: 3_5mM_PD_0LPS_11_5_C_0.tiff
+    # Treatment will be: "5mM_PD_0LPS"
+    # Comment out Option 3 above before enabling this call.
+    # ============================================================
+    # results = split_excel_all_sheets_multi_results(
+    #     EXCEL_FILE_PATH,
+    #     filename_col=0,
+    #     results_cols=None,
+    #     overwrite=False,
+    #     biological_reps=None,
+    #     biological_rep_col=1,
+    #     output_dir=OUTPUT_DIR,
+    #     include_sheet_name_in_output=True,
+    #     sort_by_filename=True,
+    #     treatment_tokens=(1, 2, 3),
+    # )
